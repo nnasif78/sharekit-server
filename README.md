@@ -1,45 +1,92 @@
-# ShareKit API
+# ShareKit API · The engine behind sharing
 
-The ShareKit API is an Express service backed by MongoDB. BetterAuth establishes user sessions; a same-origin client endpoint exchanges an authenticated session for a short-lived JWT access token. The API validates that JWT with `verifyToken` and checks renter, owner, or admin access with role-specific middleware. The API also handles equipment listings, rental reservations, Stripe Checkout and webhooks, analytics, email notifications, and scheduled rental completion.
+<p align="center">
+  <strong>Listings in. Bookings through. Good gear back in circulation.</strong><br />
+  The API that keeps the ShareKit rental marketplace moving.
+</p>
 
-## Live URL
+<p align="center">
+  <a href="https://sharekit-server.vercel.app/">Live API</a> ·
+  <a href="https://sharekit-server.vercel.app/api/health">Health check</a> ·
+  <a href="https://sharekit-client.vercel.app/">ShareKit app</a> ·
+  <a href="https://github.com/nnasif78/sharekit-client">Client repository</a>
+</p>
 
-The deployed API URL is not configured in this repository. Set the client’s `NEXT_PUBLIC_API_URL` and this server’s `CLIENT_URL` to the deployed origins.
+<p align="center">
+  <img alt="Node.js" src="https://img.shields.io/badge/Node.js-ESM-339933?logo=node.js&logoColor=white" />
+  <img alt="Express 5" src="https://img.shields.io/badge/Express-5-000000?logo=express" />
+  <img alt="MongoDB" src="https://img.shields.io/badge/MongoDB-7-47A248?logo=mongodb&logoColor=white" />
+  <img alt="Vercel deployment" src="https://img.shields.io/badge/deployed-on%20Vercel-black?logo=vercel" />
+</p>
 
-## Run locally
+---
 
-Create a server `.env` file with the required configuration and start the API:
+## One API. Every handoff.
 
-```bash
-npm install
-node index.js
+ShareKit connects renters, equipment owners, and marketplace admins with a MongoDB-backed Express API. It handles the flow from discovering available equipment to reserving inventory, confirming payment, managing rentals, and returning items to availability when a rental ends.
+
+## What it powers
+
+- **Equipment discovery and management** — searchable, filterable listings with availability and owner controls.
+- **Rental workflows** — inventory-aware reservations, booking status, and customer and owner rental views.
+- **Payments** — hosted Stripe Checkout, signed webhook processing, and checkout cancellation.
+- **Authentication and access** — Better Auth sessions exchanged by the client for short-lived JWTs, with renter, owner, and admin role checks.
+- **Marketplace operations** — favorites, moderation, dashboards, and analytics endpoints.
+- **Automatic follow-through** — rental completion, inventory release, and optional email notifications.
+
+## Live endpoints
+
+The deployed API is **[sharekit-server.vercel.app](https://sharekit-server.vercel.app/)**.
+
+```text
+GET  /api/health                         API and database health
+GET  /api/equipment                      Browse approved equipment
+POST /api/customer/equipment/:id/checkout Start a Stripe Checkout
+POST /api/stripe/webhook                 Process verified Stripe events
+GET  /api/cron/complete-rentals          Complete rentals due for return
 ```
 
-The service listens on port `5000` by default. `GET /api/health` reports API and database connectivity.
+Most customer, owner, and admin routes require a valid bearer token and the appropriate role. The health route does not require authentication. See [`index.js`](./index.js) for the complete route definitions.
 
-## Configuration
+## Run it locally
 
-Required for normal operation:
+```bash
+git clone https://github.com/nnasif78/sharekit-server.git
+cd sharekit-server
+npm install
+npm start
+```
 
-- `MONGODB_URI` — MongoDB connection string.
-- `BETTER_AUTH_SECRET` — BetterAuth session secret.
-- `BETTER_AUTH_URL` — public server origin used by BetterAuth.
-- `CLIENT_URL` — allowed client origin and return URL for checkout.
+The API listens on port `5000` by default. Set the following values in `.env`:
 
-Required for their respective features:
+```dotenv
+MONGODB_URI=your-mongodb-connection-string
+BETTER_AUTH_SECRET=your-auth-secret
+BETTER_AUTH_URL=http://localhost:5000
+CLIENT_URL=http://localhost:3000
+```
 
-- `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` — hosted checkout and verified payment webhooks.
-- `RESEND_API_KEY`, `EMAIL_FROM` — booking and rental-status email notifications through Resend.
-- `DB_NAME` — optional database name (defaults to `sharekit`).
-- `PORT` — optional HTTP port (defaults to `5000`).
+### Optional integrations
 
-Email notifications are logged as skipped when Resend is not configured. The `node-cron` job checks for approved rentals whose end date has passed at startup and at the top of every UTC hour, marks them completed, returns their reserved quantity to available inventory, and notifies the renter and owner when email is configured.
+```dotenv
+PORT=5000
+DB_NAME=sharekit
+STRIPE_SECRET_KEY=your-stripe-secret-key
+STRIPE_WEBHOOK_SECRET=your-stripe-webhook-signing-secret
+STRIPE_CURRENCY=bdt
+RESEND_API_KEY=your-resend-api-key
+EMAIL_FROM=ShareKit <updates@example.com>
+CRON_SECRET=your-cron-endpoint-secret
+```
 
-## Main packages
+Stripe keys enable checkout and signed webhook handling. Configure Stripe to send checkout events to `/api/stripe/webhook`. Resend credentials enable rental email notifications; without them, notifications are skipped. `CRON_SECRET` protects the rental completion endpoint, which a scheduler can call with `Authorization: Bearer <CRON_SECRET>`.
 
-- `express`, `cors`, `dotenv` — HTTP API, cross-origin configuration, and environment loading.
-- `mongodb` — persistence for users, equipment, rentals, payments, and reservations.
-- `better-auth`, `@better-auth/mongo-adapter` — session authentication.
-- `stripe` — checkout and webhook integration.
-- `node-cron` — scheduled rental completion.
-- `jose`, `zod` — token and schema utilities.
+## Built with
+
+Node.js · Express 5 · MongoDB · Better Auth · Stripe · Resend · `jose` · `node-cron`
+
+## Connect the client
+
+Set `NEXT_PUBLIC_API_URL` in the [ShareKit client](https://github.com/nnasif78/sharekit-client) to this API origin, and set `CLIENT_URL` here to the deployed client origin.
+
+**[Open the ShareKit app →](https://sharekit-client.vercel.app/)**
