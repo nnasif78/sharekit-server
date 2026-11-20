@@ -2,6 +2,7 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
+import cron from "node-cron";
 import { MongoClient, ObjectId } from "mongodb";
 import Stripe from "stripe";
 import { jwtVerify } from "jose";
@@ -903,7 +904,7 @@ app.get("/api/admin/analytics", verifyToken, verifyAdmin, async (_req, res) => {
         users: users.length,
         equipment: equipment.length,
         bookings: rentals.length,
-        approvals: equipment.filter((item) => String(item.status || "").toLowerCase() === "approved").length,
+        pendingApprovals: equipment.filter((item) => String(item.status || "").toLowerCase() === "pending").length,
         completedRentals: rentals.filter((rental) => String(rental.status || rental.bookingStatus || "").toLowerCase() === "completed").length,
         revenue: Number(revenue.toFixed(2)),
         monthlyBookings,
@@ -1389,7 +1390,9 @@ async function startServer() {
     console.log("MongoDB connected successfully");
     console.log("Better Auth session verification configured");
     await completeDueRentals();
-    setInterval(() => void completeDueRentals(), 60 * 60 * 1000);
+    cron.schedule("0 * * * *", () => {
+      void completeDueRentals();
+    }, { timezone: "UTC" });
 
     app.listen(PORT, () => {
       console.log(`ShareKit server running on port ${PORT}`);

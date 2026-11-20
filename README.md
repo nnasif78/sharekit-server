@@ -33,12 +33,13 @@ Required for their respective features:
 - `DB_NAME` — optional database name (defaults to `sharekit`).
 - `PORT` — optional HTTP port (defaults to `5000`).
 
-Email notifications are logged as skipped when Resend is not configured. The scheduled job checks for approved rentals whose end date has passed at startup and once per hour, marks them completed, and returns their reserved quantity to available inventory.
+Email notifications are logged as skipped when Resend is not configured. The `node-cron` job checks for approved rentals whose end date has passed at startup and at the top of every UTC hour, marks them completed, returns their reserved quantity to available inventory, and notifies the renter and owner when email is configured.
 
 ## Main packages
 
-- `express`, `cors` — HTTP API and cross-origin configuration.
+- `express`, `cors`, `dotenv` — HTTP API, cross-origin configuration, and environment loading.
 - `mongodb` — persistence for users, equipment, rentals, payments, and reservations.
 - `better-auth`, `@better-auth/mongo-adapter` — session authentication.
 - `stripe` — checkout and webhook integration.
+- `node-cron` — scheduled rental completion.
 - `jose`, `zod` — token and schema utilities.
