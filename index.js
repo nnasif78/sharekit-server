@@ -3,6 +3,7 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import { MongoClient, ObjectId } from "mongodb";
+import Stripe from "stripe";
 import { betterAuth } from "better-auth";
 import { mongodbAdapter } from "@better-auth/mongo-adapter";
 import { fromNodeHeaders } from "better-auth/node";
@@ -17,6 +18,91 @@ let auth;
 let equipmentCollection;
 let rentalsCollection;
 let usersCollection;
+let reservationsCollection;
+let paymentsCollection;
+
+const getStripe = () => {
+  if (!process.env.STRIPE_SECRET_KEY) throw new Error("Stripe is not configured");
+  return new Stripe(process.env.STRIPE_SECRET_KEY);
+};
+
+const periodDays = (rentalType) => rentalType === "weekly" ? 7 : rentalType === "monthly" ? 30 : 1;
+
+const releaseReservation = async (reservationId, status) => {
+  if (!ObjectId.isValid(reservationId)) return;
+  const result = await reservationsCollection.updateOne(
+    { _id: new ObjectId(reservationId), status: "pending", inventoryReleased: { $ne: true } },
+    { $set: { status, inventoryReleased: true, updatedAt: new Date() } }
+  );
+  if (result.modifiedCount) {
+    const reservation = await reservationsCollection.findOne({ _id: new ObjectId(reservationId) });
+    if (reservation) await equipmentCollection.updateOne({ _id: reservation.equipmentId }, { $inc: { availableQuantity: reservation.quantity } });
+  }
+};
+
+const fulfillCheckout = async (checkoutSession) => {
+  const reservationId = checkoutSession.metadata?.reservationId;
+  if (!ObjectId.isValid(reservationId) || checkoutSession.payment_status !== "paid") return;
+  const reservation = await reservationsCollection.findOne({ _id: new ObjectId(reservationId) });
+  if (!reservation || reservation.status === "cancelled" || reservation.status === "expired") return;
+  if (checkoutSession.amount_total !== reservation.amountMinor || checkoutSession.currency !== reservation.currency) {
+    console.error("Stripe checkout amount mismatch", checkoutSession.id);
+    return;
+  }
+
+  const rental = {
+    checkoutSessionId: checkoutSession.id,
+    reservationId: reservation._id.toString(),
+    customerId: reservation.customerId,
+    customerName: reservation.customerName,
+    customerEmail: reservation.customerEmail,
+    ownerId: reservation.ownerId,
+    ownerName: reservation.ownerName,
+    ownerEmail: reservation.ownerEmail,
+    equipmentId: reservation.equipmentId,
+    equipmentName: reservation.equipmentName,
+    startDate: reservation.startDate,
+    endDate: reservation.endDate,
+    rentalDays: reservation.rentalDays,
+    billableUnits: reservation.billableUnits,
+    quantity: reservation.quantity,
+    requiredQuantity: reservation.quantity,
+    contactNumber: reservation.contactNumber,
+    deliveryAddress: reservation.deliveryAddress,
+    additionalNotes: reservation.additionalNotes,
+    bookingAmount: reservation.totalAmount,
+    totalAmount: reservation.totalAmount,
+    currency: reservation.currency,
+    paymentStatus: "paid",
+    paymentIntentId: typeof checkoutSession.payment_intent === "string" ? checkoutSession.payment_intent : checkoutSession.payment_intent?.id,
+    status: "pending",
+    bookingStatus: "pending",
+    createdAt: reservation.createdAt,
+    updatedAt: new Date(),
+  };
+  await rentalsCollection.updateOne({ checkoutSessionId: checkoutSession.id }, { $setOnInsert: rental }, { upsert: true });
+  await paymentsCollection.updateOne({ stripeSessionId: checkoutSession.id }, { $setOnInsert: {
+    stripeSessionId: checkoutSession.id,
+    paymentIntentId: rental.paymentIntentId,
+    reservationId: reservation._id.toString(),
+    customerId: reservation.customerId,
+    equipmentId: reservation.equipmentId,
+    amount: reservation.totalAmount,
+    amountMinor: checkoutSession.amount_total,
+    currency: checkoutSession.currency,
+    status: "paid",
+    transactionDetails: {
+      checkoutSessionId: checkoutSession.id,
+      paymentIntentId: rental.paymentIntentId,
+      customerEmail: reservation.customerEmail,
+      amount: reservation.totalAmount,
+      currency: reservation.currency,
+      paymentStatus: "paid",
+    },
+    createdAt: new Date(),
+  } }, { upsert: true });
+  await reservationsCollection.updateOne({ _id: reservation._id, status: "pending" }, { $set: { status: "paid", paymentStatus: "paid", paymentIntentId: rental.paymentIntentId, updatedAt: new Date() } });
+};
 
 app.use(
   cors({
@@ -24,6 +110,29 @@ app.use(
     credentials: true,
   })
 );
+
+// Stripe requires the unparsed request bytes to verify webhook signatures.
+app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async (req, res) => {
+  let event;
+  try {
+    if (!process.env.STRIPE_WEBHOOK_SECRET) return res.status(500).send("Webhook is not configured");
+    event = getStripe().webhooks.constructEvent(req.body, req.headers["stripe-signature"], process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (error) {
+    console.error("Stripe webhook signature error:", error.message);
+    return res.status(400).send("Invalid Stripe webhook signature");
+  }
+  try {
+    if (event.type === "checkout.session.completed" || event.type === "checkout.session.async_payment_succeeded") {
+      await fulfillCheckout(event.data.object);
+    } else if (event.type === "checkout.session.expired" || event.type === "checkout.session.async_payment_failed") {
+      await releaseReservation(event.data.object.metadata?.reservationId, "expired");
+    }
+    res.json({ received: true });
+  } catch (error) {
+    console.error("Stripe webhook processing error:", error);
+    res.status(500).json({ received: false });
+  }
+});
 
 app.use(express.json());
 
@@ -124,8 +233,7 @@ app.get("/api/equipment", async (req, res) => {
 
       query.$or = [
         { name: searchRegex },
-        { category: searchRegex },
-        { description: searchRegex },
+        { location: searchRegex },
       ];
     }
 
@@ -184,6 +292,18 @@ app.get("/api/equipment", async (req, res) => {
       success: false,
       message: "Failed to fetch equipment",
     });
+  }
+});
+
+app.get("/api/equipment/:id", async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) return res.status(400).json({ success: false, message: "Invalid equipment ID" });
+    const equipment = await equipmentCollection.findOne({ _id: new ObjectId(req.params.id), status: "approved" });
+    if (!equipment) return res.status(404).json({ success: false, message: "Equipment not found" });
+    res.json({ success: true, data: { ...equipment, _id: equipment._id.toString() } });
+  } catch (error) {
+    console.error("Equipment detail fetch error:", error);
+    res.status(500).json({ success: false, message: "Failed to fetch equipment details" });
   }
 });
 
@@ -754,8 +874,17 @@ app.patch("/api/admin/rentals/:id/status", requireAuth, requireRole("admin"), as
     const { status } = req.body;
     if (!ObjectId.isValid(id)) return res.status(400).json({ success: false, message: "Invalid rental ID" });
     if (!["pending", "approved", "rejected", "cancelled", "completed"].includes(status)) return res.status(400).json({ success: false, message: "Invalid booking status" });
-    const result = await rentalsCollection.updateOne({ _id: new ObjectId(id) }, { $set: { status, bookingStatus: status, updatedAt: new Date() } });
-    if (!result.matchedCount) return res.status(404).json({ success: false, message: "Rental not found" });
+    const rental = await rentalsCollection.findOne({ _id: new ObjectId(id) });
+    if (!rental) return res.status(404).json({ success: false, message: "Rental not found" });
+    const terminalStatuses = ["rejected", "cancelled", "completed"];
+    if (terminalStatuses.includes(rental.status) && status !== rental.status) return res.status(409).json({ success: false, message: "A closed rental cannot be reopened" });
+    const shouldRelease = terminalStatuses.includes(status) && !rental.inventoryReleased;
+    const result = await rentalsCollection.updateOne(
+      { _id: rental._id, status: rental.status, ...(shouldRelease ? { inventoryReleased: { $ne: true } } : {}) },
+      { $set: { status, bookingStatus: status, ...(shouldRelease ? { inventoryReleased: true } : {}), updatedAt: new Date() } }
+    );
+    if (!result.matchedCount) return res.status(409).json({ success: false, message: "Rental status changed. Refresh and try again." });
+    if (shouldRelease) await equipmentCollection.updateOne({ _id: rental.equipmentId }, { $inc: { availableQuantity: rental.quantity || rental.requiredQuantity || 0 } });
     res.json({ success: true, message: "Rental status updated" });
   } catch (error) {
     console.error("Admin rental status update error:", error);
@@ -801,7 +930,6 @@ app.patch("/api/profile", requireAuth, async (req, res) => {
 // CUSTOMER: their own rental bookings
 app.get("/api/customer/rentals", requireAuth, requireRole("customer"), async (req, res) => {
   try {
-    const identityValues = [req.user.id, req.user.email].filter(Boolean);
     const customerIds = [req.user.id, ...(ObjectId.isValid(req.user.id) ? [new ObjectId(req.user.id)] : [])];
     const rentals = await rentalsCollection.find({ $or: [
       { customerId: { $in: customerIds } }, { userId: { $in: customerIds } },
@@ -869,6 +997,139 @@ app.delete("/api/customer/favorites/:equipmentId", requireAuth, requireRole("cus
   }
 });
 
+// CUSTOMER: reserve available quantity and create a hosted Stripe Checkout Session
+app.post("/api/customer/equipment/:equipmentId/checkout", requireAuth, requireRole("customer"), async (req, res) => {
+  let reservationId;
+  let inventoryReserved = false;
+  try {
+    const { equipmentId } = req.params;
+    const { startDate, endDate, quantity, contactNumber, deliveryAddress, additionalNotes = "" } = req.body;
+    if (!ObjectId.isValid(equipmentId)) return res.status(400).json({ success: false, message: "Invalid equipment ID" });
+    if (!Number.isInteger(quantity) || quantity < 1) return res.status(400).json({ success: false, message: "Quantity must be a positive whole number" });
+    if (typeof contactNumber !== "string" || !contactNumber.trim() || typeof deliveryAddress !== "string" || !deliveryAddress.trim()) return res.status(400).json({ success: false, message: "Contact number and delivery address are required" });
+    if (typeof additionalNotes !== "string" || additionalNotes.length > 1000) return res.status(400).json({ success: false, message: "Additional notes are too long" });
+    const start = new Date(`${startDate}T00:00:00.000Z`);
+    const end = new Date(`${endDate}T00:00:00.000Z`);
+    const today = new Date(); today.setUTCHours(0, 0, 0, 0);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(startDate || "") || !/^\d{4}-\d{2}-\d{2}$/.test(endDate || "") || Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start < today || end < start) {
+      return res.status(400).json({ success: false, message: "Choose valid rental dates. The start date must be today or later." });
+    }
+    if (!process.env.STRIPE_SECRET_KEY) return res.status(503).json({ success: false, message: "Online payment is not configured yet" });
+
+    const equipmentIdObject = new ObjectId(equipmentId);
+    const equipment = await equipmentCollection.findOne({ _id: equipmentIdObject, status: "approved" });
+    if (!equipment) return res.status(404).json({ success: false, message: "Approved equipment not found" });
+    const rentalDays = Math.floor((end - start) / 86400000) + 1;
+    const billableUnits = Math.ceil(rentalDays / periodDays(equipment.rentalType));
+    const totalAmount = Number((equipment.price * billableUnits * quantity).toFixed(2));
+    const currency = (process.env.STRIPE_CURRENCY || "bdt").toLowerCase();
+    const amountMinor = Math.round(totalAmount * 100);
+    if (!Number.isSafeInteger(amountMinor) || amountMinor <= 0) return res.status(400).json({ success: false, message: "Booking amount is invalid" });
+
+    const reservationResult = await equipmentCollection.updateOne(
+      { _id: equipmentIdObject, status: "approved", price: equipment.price, availableQuantity: { $gte: quantity } },
+      { $inc: { availableQuantity: -quantity }, $set: { updatedAt: new Date() } }
+    );
+    if (!reservationResult.matchedCount) return res.status(409).json({ success: false, message: "This equipment no longer has enough quantity available" });
+    inventoryReserved = true;
+
+    const now = new Date();
+    const reservation = {
+      customerId: req.user.id,
+      customerName: req.user.name,
+      customerEmail: req.user.email,
+      ownerId: equipment.ownerId,
+      ownerName: equipment.ownerName,
+      ownerEmail: equipment.ownerEmail,
+      equipmentId: equipmentIdObject,
+      equipmentName: equipment.name,
+      rentalType: equipment.rentalType,
+      unitPrice: equipment.price,
+      startDate: start.toISOString(),
+      endDate: end.toISOString(),
+      rentalDays,
+      billableUnits,
+      quantity,
+      contactNumber: contactNumber.trim(),
+      deliveryAddress: deliveryAddress.trim(),
+      additionalNotes: additionalNotes.trim(),
+      totalAmount,
+      amountMinor,
+      currency,
+      status: "pending",
+      paymentStatus: "unpaid",
+      inventoryReleased: false,
+      createdAt: now,
+      updatedAt: now,
+    };
+    const insertResult = await reservationsCollection.insertOne(reservation);
+    reservationId = insertResult.insertedId.toString();
+    const baseUrl = (process.env.CLIENT_URL || "http://localhost:3000").replace(/\/$/, "");
+    const checkoutSession = await getStripe().checkout.sessions.create({
+      mode: "payment",
+      payment_method_types: ["card"],
+      customer_email: req.user.email,
+      client_reference_id: req.user.id,
+      line_items: [{
+        quantity: 1,
+        price_data: {
+          currency,
+          unit_amount: amountMinor,
+          product_data: {
+            name: `${equipment.name} rental`,
+            description: `${rentalDays} day(s), ${quantity} item(s), ${startDate} to ${endDate}`.slice(0, 500),
+          },
+        },
+      }],
+      metadata: { reservationId, customerId: req.user.id, equipmentId },
+      expires_at: Math.floor(Date.now() / 1000) + 30 * 60,
+      success_url: `${baseUrl}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${baseUrl}/payment/cancel?reservation_id=${reservationId}`,
+    });
+    await reservationsCollection.updateOne({ _id: insertResult.insertedId }, { $set: { stripeSessionId: checkoutSession.id, updatedAt: new Date() } });
+    res.status(201).json({ success: true, data: { checkoutUrl: checkoutSession.url, totalAmount, currency, rentalDays, billableUnits } });
+  } catch (error) {
+    console.error("Checkout creation error:", error);
+    if (reservationId) await releaseReservation(reservationId, "checkout_failed").catch((releaseError) => console.error("Inventory release error:", releaseError));
+    else if (inventoryReserved) await equipmentCollection.updateOne({ _id: new ObjectId(req.params.equipmentId) }, { $inc: { availableQuantity: req.body.quantity } }).catch((releaseError) => console.error("Inventory release error:", releaseError));
+    res.status(500).json({ success: false, message: error.message === "Stripe is not configured" ? "Online payment is not configured yet" : "Could not start checkout" });
+  }
+});
+
+// CUSTOMER: cancel an open checkout and release its inventory hold
+app.post("/api/customer/checkout/:reservationId/cancel", requireAuth, requireRole("customer"), async (req, res) => {
+  try {
+    const { reservationId } = req.params;
+    if (!ObjectId.isValid(reservationId)) return res.status(400).json({ success: false, message: "Invalid reservation ID" });
+    const reservation = await reservationsCollection.findOne({ _id: new ObjectId(reservationId), customerId: req.user.id, status: "pending" });
+    if (!reservation) return res.json({ success: true, message: "Reservation is already closed" });
+    if (reservation.stripeSessionId) {
+      const stripe = getStripe();
+      const session = await stripe.checkout.sessions.retrieve(reservation.stripeSessionId);
+      if (session.status === "open") await stripe.checkout.sessions.expire(reservation.stripeSessionId);
+      else if (session.payment_status === "paid") return res.json({ success: true, message: "Payment is being confirmed" });
+    }
+    await releaseReservation(reservationId, "cancelled");
+    res.json({ success: true, message: "Checkout cancelled" });
+  } catch (error) {
+    console.error("Checkout cancellation error:", error);
+    res.status(500).json({ success: false, message: "Could not cancel checkout" });
+  }
+});
+
+// CUSTOMER: retrieve their own Checkout result for the confirmation screen
+app.get("/api/customer/checkout/:sessionId", requireAuth, requireRole("customer"), async (req, res) => {
+  try {
+    const session = await getStripe().checkout.sessions.retrieve(req.params.sessionId);
+    if (session.client_reference_id !== req.user.id) return res.status(404).json({ success: false, message: "Checkout session not found" });
+    const rental = await rentalsCollection.findOne({ checkoutSessionId: session.id }, { projection: { _id: 1, equipmentName: 1 } });
+    res.json({ success: true, data: { paymentStatus: session.payment_status, bookingCreated: Boolean(rental), equipmentName: rental?.equipmentName || "", bookingId: rental?._id.toString() || "" } });
+  } catch (error) {
+    console.error("Checkout status fetch error:", error);
+    res.status(404).json({ success: false, message: "Checkout session not found" });
+  }
+});
+
 // Start server
 async function startServer() {
   try {
@@ -879,6 +1140,10 @@ async function startServer() {
     equipmentCollection = db.collection("equipment");
     rentalsCollection = db.collection("rentals");
     usersCollection = db.collection("user");
+    reservationsCollection = db.collection("rentalReservations");
+    paymentsCollection = db.collection("payments");
+    await rentalsCollection.createIndex({ checkoutSessionId: 1 }, { unique: true, sparse: true });
+    await paymentsCollection.createIndex({ stripeSessionId: 1 }, { unique: true, sparse: true });
 
     // Better Auth uses the same MongoDB database and secret
     auth = betterAuth({
