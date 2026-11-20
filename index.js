@@ -1037,7 +1037,9 @@ app.post("/api/customer/equipment/:equipmentId/checkout", requireAuth, requireRo
     if (!/^\d{4}-\d{2}-\d{2}$/.test(startDate || "") || !/^\d{4}-\d{2}-\d{2}$/.test(endDate || "") || Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start < today || end < start) {
       return res.status(400).json({ success: false, message: "Choose valid rental dates. The start date must be today or later." });
     }
-    if (!process.env.STRIPE_SECRET_KEY) return res.status(503).json({ success: false, message: "Online payment is not configured yet" });
+    if (!process.env.STRIPE_SECRET_KEY || !process.env.STRIPE_WEBHOOK_SECRET) {
+      return res.status(503).json({ success: false, message: "Online payment is not fully configured. Set the Stripe API key and webhook signing secret on the server." });
+    }
 
     const equipmentIdObject = new ObjectId(equipmentId);
     const equipment = await equipmentCollection.findOne({ _id: equipmentIdObject, status: "approved" });
@@ -1090,7 +1092,6 @@ app.post("/api/customer/equipment/:equipmentId/checkout", requireAuth, requireRo
     const baseUrl = (process.env.CLIENT_URL || "http://localhost:3000").replace(/\/$/, "");
     const checkoutSession = await getStripe().checkout.sessions.create({
       mode: "payment",
-      payment_method_types: ["card"],
       customer_email: req.user.email,
       client_reference_id: req.user.id,
       line_items: [{
@@ -1115,7 +1116,13 @@ app.post("/api/customer/equipment/:equipmentId/checkout", requireAuth, requireRo
     console.error("Checkout creation error:", error);
     if (reservationId) await releaseReservation(reservationId, "checkout_failed").catch((releaseError) => console.error("Inventory release error:", releaseError));
     else if (inventoryReserved) await equipmentCollection.updateOne({ _id: new ObjectId(req.params.equipmentId) }, { $inc: { availableQuantity: req.body.quantity } }).catch((releaseError) => console.error("Inventory release error:", releaseError));
-    res.status(500).json({ success: false, message: error.message === "Stripe is not configured" ? "Online payment is not configured yet" : "Could not start checkout" });
+    const checkoutError = error?.raw?.message || error?.message;
+    const message = error.message === "Stripe is not configured"
+      ? "Online payment is not configured yet"
+      : process.env.NODE_ENV === "production"
+        ? "Could not start checkout"
+        : checkoutError || "Could not start checkout";
+    res.status(500).json({ success: false, message });
   }
 });
 
@@ -1145,6 +1152,7 @@ app.get("/api/customer/checkout/:sessionId", requireAuth, requireRole("customer"
   try {
     const session = await getStripe().checkout.sessions.retrieve(req.params.sessionId);
     if (session.client_reference_id !== req.user.id) return res.status(404).json({ success: false, message: "Checkout session not found" });
+    if (session.payment_status === "paid") await fulfillCheckout(session);
     const rental = await rentalsCollection.findOne({ checkoutSessionId: session.id }, { projection: { _id: 1, equipmentName: 1 } });
     res.json({ success: true, data: { paymentStatus: session.payment_status, bookingCreated: Boolean(rental), equipmentName: rental?.equipmentName || "", bookingId: rental?._id.toString() || "" } });
   } catch (error) {
