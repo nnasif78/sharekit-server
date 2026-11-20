@@ -6,10 +6,10 @@
 </p>
 
 <p align="center">
-  <a href="https://sharekit-server.vercel.app/">Live API</a> ·
-  <a href="https://sharekit-server.vercel.app/api/health">Health check</a> ·
-  <a href="https://sharekit-client.vercel.app/">ShareKit app</a> ·
-  <a href="https://github.com/nnasif78/sharekit-client">Client repository</a>
+  <a href="https://sharekit-server.vercel.app/"><img alt="Live API" src="https://img.shields.io/badge/Live%20API-6C5CE7?style=for-the-badge&logo=vercel&logoColor=white" /></a>
+  <a href="https://sharekit-server.vercel.app/api/health"><img alt="Health check" src="https://img.shields.io/badge/Health%20Check-00A884?style=for-the-badge&logo=fastapi&logoColor=white" /></a>
+  <a href="https://sharekit-client.vercel.app/"><img alt="ShareKit app" src="https://img.shields.io/badge/ShareKit%20App-F5A623?style=for-the-badge&logo=vercel&logoColor=white" /></a>
+  <a href="https://github.com/nnasif78/sharekit-client"><img alt="Client repository" src="https://img.shields.io/badge/Client%20Repository-24292F?style=for-the-badge&logo=github&logoColor=white" /></a>
 </p>
 
 <p align="center">
