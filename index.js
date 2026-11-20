@@ -2,7 +2,6 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
-import cron from "node-cron";
 import { MongoClient, ObjectId } from "mongodb";
 import Stripe from "stripe";
 import { jwtVerify } from "jose";
@@ -21,6 +20,68 @@ let rentalsCollection;
 let usersCollection;
 let reservationsCollection;
 let paymentsCollection;
+
+let connectionPromise = null;
+
+async function connectToDatabase() {
+  if (db) return db;
+
+  if (!connectionPromise) {
+    connectionPromise = (async () => {
+      await client.connect();
+
+      db = client.db(process.env.DB_NAME || "sharekit");
+
+      equipmentCollection = db.collection("equipment");
+      rentalsCollection = db.collection("rentals");
+      usersCollection = db.collection("user");
+      reservationsCollection = db.collection("rentalReservations");
+      paymentsCollection = db.collection("payments");
+
+      await rentalsCollection.createIndex(
+        { checkoutSessionId: 1 },
+        { unique: true, sparse: true }
+      );
+
+      await paymentsCollection.createIndex(
+        { stripeSessionId: 1 },
+        { unique: true, sparse: true }
+      );
+
+      auth = betterAuth({
+        database: mongodbAdapter(db, {
+          client,
+        }),
+
+        baseURL: process.env.BETTER_AUTH_URL,
+
+        secret: process.env.BETTER_AUTH_SECRET,
+
+        user: {
+          additionalFields: {
+            role: {
+              type: "string",
+              required: false,
+              defaultValue: "customer",
+              input: false,
+            },
+          },
+        },
+      });
+
+      console.log("MongoDB connected successfully");
+      console.log("Better Auth session verification configured");
+
+      return db;
+    })().catch((error) => {
+      connectionPromise = null;
+      db = null;
+      throw error;
+    });
+  }
+
+  return connectionPromise;
+}
 
 const getStripe = () => {
   if (!process.env.STRIPE_SECRET_KEY) throw new Error("Stripe is not configured");
@@ -150,6 +211,21 @@ app.use(
     credentials: true,
   })
 );
+
+// Connect to MongoDB before handling API requests.
+app.use(async (req, res, next) => {
+  try {
+    await connectToDatabase();
+    next();
+  } catch (error) {
+    console.error("Database connection error:", error);
+
+    res.status(503).json({
+      success: false,
+      message: "Database connection unavailable",
+    });
+  }
+});
 
 // Stripe requires the unparsed request bytes to verify webhook signatures.
 app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async (req, res) => {
@@ -1345,62 +1421,53 @@ const completeDueRentals = async () => {
     }
   } catch (error) {
     console.error("Scheduled rental completion failed:", error);
+    throw error;
   } finally {
     completionJobRunning = false;
   }
 };
 
-// Start server
-async function startServer() {
-  try {
-    await client.connect();
+// Vercel Cron: complete rentals whose end dates have passed.
+app.get("/api/cron/complete-rentals", async (req, res) => {
+  const cronSecret = process.env.CRON_SECRET;
 
-    db = client.db(process.env.DB_NAME || "sharekit");
-
-    equipmentCollection = db.collection("equipment");
-    rentalsCollection = db.collection("rentals");
-    usersCollection = db.collection("user");
-    reservationsCollection = db.collection("rentalReservations");
-    paymentsCollection = db.collection("payments");
-    await rentalsCollection.createIndex({ checkoutSessionId: 1 }, { unique: true, sparse: true });
-    await paymentsCollection.createIndex({ stripeSessionId: 1 }, { unique: true, sparse: true });
-
-    // Better Auth uses the same MongoDB database and secret
-    auth = betterAuth({
-      database: mongodbAdapter(db, {
-        client,
-      }),
-
-      baseURL: process.env.BETTER_AUTH_URL,
-
-      secret: process.env.BETTER_AUTH_SECRET,
-
-      user: {
-        additionalFields: {
-          role: {
-            type: "string",
-            required: false,
-            defaultValue: "customer",
-            input: false,
-          },
-        },
-      },
+  if (!cronSecret) {
+    return res.status(500).json({
+      success: false,
+      message: "Cron authentication is not configured",
     });
+  }
 
-    console.log("MongoDB connected successfully");
-    console.log("Better Auth session verification configured");
+  if (req.headers.authorization !== `Bearer ${cronSecret}`) {
+    return res.status(401).json({
+      success: false,
+      message: "Unauthorized",
+    });
+  }
+
+  try {
     await completeDueRentals();
-    cron.schedule("0 * * * *", () => {
-      void completeDueRentals();
-    }, { timezone: "UTC" });
 
-    app.listen(PORT, () => {
-      console.log(`ShareKit server running on port ${PORT}`);
+    res.json({
+      success: true,
+      message: "Rental completion job executed",
     });
   } catch (error) {
-    console.error("Server startup failed:", error.message);
-    process.exit(1);
+    console.error("Cron endpoint error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Rental completion job failed",
+    });
   }
+});
+
+// Local development server.
+// Vercel imports the Express app directly.
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`ShareKit server running on port ${PORT}`);
+  });
 }
 
-startServer();
+export default app;
