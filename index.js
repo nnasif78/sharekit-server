@@ -4,9 +4,9 @@ import express from "express";
 import cors from "cors";
 import { MongoClient, ObjectId } from "mongodb";
 import Stripe from "stripe";
+import { jwtVerify } from "jose";
 import { betterAuth } from "better-auth";
 import { mongodbAdapter } from "@better-auth/mongo-adapter";
-import { fromNodeHeaders } from "better-auth/node";
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -28,6 +28,37 @@ const getStripe = () => {
 
 const periodDays = (rentalType) => rentalType === "weekly" ? 7 : rentalType === "monthly" ? 30 : 1;
 const equipmentSlug = (name) => name.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "equipment";
+let completionJobRunning = false;
+
+const sendNotification = async ({ to, subject, text }) => {
+  if (!process.env.RESEND_API_KEY || !process.env.EMAIL_FROM) {
+    console.warn(`Email notification skipped for ${to}: configure RESEND_API_KEY and EMAIL_FROM`);
+    return;
+  }
+  const response = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ from: process.env.EMAIL_FROM, to: [to], subject, text }),
+  });
+  if (!response.ok) {
+    const details = await response.text();
+    throw new Error(`Email delivery failed (${response.status}): ${details}`);
+  }
+};
+
+const notifyRental = async (recipients, subject, text) => {
+  const results = await Promise.allSettled(
+    [...new Set(recipients.filter((email) => typeof email === "string" && email))].map((to) =>
+      sendNotification({ to, subject, text })
+    )
+  );
+  for (const result of results) {
+    if (result.status === "rejected") console.error("Rental notification error:", result.reason);
+  }
+};
 
 const releaseReservation = async (reservationId, status) => {
   if (!ObjectId.isValid(reservationId)) return;
@@ -81,7 +112,7 @@ const fulfillCheckout = async (checkoutSession) => {
     createdAt: reservation.createdAt,
     updatedAt: new Date(),
   };
-  await rentalsCollection.updateOne({ checkoutSessionId: checkoutSession.id }, { $setOnInsert: rental }, { upsert: true });
+  const rentalResult = await rentalsCollection.updateOne({ checkoutSessionId: checkoutSession.id }, { $setOnInsert: rental }, { upsert: true });
   await paymentsCollection.updateOne({ stripeSessionId: checkoutSession.id }, { $setOnInsert: {
     stripeSessionId: checkoutSession.id,
     paymentIntentId: rental.paymentIntentId,
@@ -103,6 +134,13 @@ const fulfillCheckout = async (checkoutSession) => {
     createdAt: new Date(),
   } }, { upsert: true });
   await reservationsCollection.updateOne({ _id: reservation._id, status: "pending" }, { $set: { status: "paid", paymentStatus: "paid", paymentIntentId: rental.paymentIntentId, updatedAt: new Date() } });
+  if (rentalResult.upsertedCount) {
+    await notifyRental(
+      [reservation.customerEmail, reservation.ownerEmail],
+      `Rental booked: ${reservation.equipmentName}`,
+      `Payment is confirmed for ${reservation.equipmentName}. Rental dates: ${reservation.startDate} to ${reservation.endDate}.`
+    );
+  }
 };
 
 app.use(
@@ -151,43 +189,45 @@ app.get("/api/health", (req, res) => {
 });
 
 // Authentication middleware
-const requireAuth = async (req, res, next) => {
-  try {
-    const session = await auth.api.getSession({
-      headers: fromNodeHeaders(req.headers),
-    });
-
-    if (!session) {
-      return res.status(401).json({
-        success: false,
-        message: "Please login to continue",
-      });
-    }
-
-    const account = await usersCollection.findOne(
-      userIdQuery(session.user.id),
-      { projection: { disabled: 1, role: 1 } }
-    );
-    if (account?.disabled) {
-      return res.status(403).json({ success: false, message: "This account is disabled" });
-    }
-
-    req.user = { ...session.user, role: account?.role || session.user.role };
-    req.session = session.session;
-
-    next();
-  } catch (error) {
-    console.error("Authentication error:", error);
-
-    res.status(401).json({
-      success: false,
-      message: "Authentication failed",
-    });
+const verifyToken = async (req, res, next) => {
+  const authorization = req.headers.authorization || "";
+  const token = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
+  if (!token) {
+    return res.status(401).json({ success: false, message: "A valid access token is required" });
   }
+  const secret = process.env.BETTER_AUTH_SECRET;
+  if (!secret) {
+    console.error("JWT authentication configuration error: BETTER_AUTH_SECRET is not configured");
+    return res.status(500).json({ success: false, message: "Authentication is not configured" });
+  }
+
+  let payload;
+  try {
+    ({ payload } = await jwtVerify(token, new TextEncoder().encode(secret), { algorithms: ["HS256"] }));
+  } catch {
+    return res.status(401).json({ success: false, message: "Access token is invalid or expired" });
+  }
+
+  if (typeof payload.sub !== "string") {
+    return res.status(401).json({ success: false, message: "Access token is invalid" });
+  }
+
+  const account = await usersCollection.findOne(userIdQuery(payload.sub), {
+    projection: { disabled: 1, role: 1, name: 1, email: 1 },
+  });
+  if (!account) return res.status(401).json({ success: false, message: "Account not found" });
+  if (account.disabled) return res.status(403).json({ success: false, message: "This account is disabled" });
+
+  req.user = {
+    id: payload.sub,
+    name: account.name || "",
+    email: account.email || "",
+    role: account.role || payload.role || "customer",
+  };
+  next();
 };
 
-// Role authorization middleware
-const requireRole = (...roles) => {
+const verifyRole = (...roles) => {
   return (req, res, next) => {
     if (!req.user || !roles.includes(req.user.role)) {
       return res.status(403).json({
@@ -199,6 +239,9 @@ const requireRole = (...roles) => {
     next();
   };
 };
+const verifyRenter = verifyRole("customer");
+const verifyOwner = verifyRole("owner");
+const verifyAdmin = verifyRole("admin");
 
 // Escape user input before using regular expressions
 const escapeRegex = (value) =>
@@ -222,7 +265,15 @@ app.get("/api/equipment", async (req, res) => {
       maxPrice,
       availability,
       sort,
+      page = "1",
+      pageSize = "9",
     } = req.query;
+    const pageNumber = Number(page);
+    const requestedPageSize = Number(pageSize);
+    if (!Number.isInteger(pageNumber) || pageNumber < 1 || !Number.isInteger(requestedPageSize) || requestedPageSize < 1) {
+      return res.status(400).json({ success: false, message: "Page and page size must be positive whole numbers" });
+    }
+    const limit = Math.min(requestedPageSize, 48);
 
     const query = { status: "approved" };
 
@@ -276,14 +327,15 @@ app.get("/api/equipment", async (req, res) => {
       sortOption = { price: -1 };
     }
 
-    const equipment = await equipmentCollection
-      .find(query)
-      .sort(sortOption)
-      .toArray();
+    const [equipment, totalCount] = await Promise.all([
+      equipmentCollection.find(query).sort(sortOption).skip((pageNumber - 1) * limit).limit(limit).toArray(),
+      equipmentCollection.countDocuments(query),
+    ]);
 
     res.json({
       success: true,
-      count: equipment.length,
+      count: totalCount,
+      pagination: { page: pageNumber, pageSize: limit, totalPages: Math.ceil(totalCount / limit) },
       data: equipment,
     });
   } catch (error) {
@@ -327,8 +379,8 @@ app.get("/api/equipment/:id", async (req, res) => {
 // OWNER: Add equipment
 app.post(
   "/api/equipment",
-  requireAuth,
-  requireRole("owner"),
+  verifyToken,
+  verifyOwner,
   async (req, res) => {
     try {
       const {
@@ -438,8 +490,8 @@ app.post(
 // OWNER: Get own equipment
 app.get(
   "/api/my-equipment",
-  requireAuth,
-  requireRole("owner"),
+  verifyToken,
+  verifyOwner,
   async (req, res) => {
     try {
       const equipment = await equipmentCollection
@@ -466,8 +518,8 @@ app.get(
 // OWNER: Get rentals for this owner's equipment
 app.get(
   "/api/owner/rentals",
-  requireAuth,
-  requireRole("owner"),
+  verifyToken,
+  verifyOwner,
   async (req, res) => {
     try {
       const equipment = await equipmentCollection
@@ -511,11 +563,54 @@ app.get(
   }
 );
 
+app.get("/api/owner/analytics", verifyToken, verifyOwner, async (req, res) => {
+  try {
+    const equipment = await equipmentCollection.find({ ownerId: req.user.id }, { projection: { _id: 1 } }).toArray();
+    const equipmentIds = equipment.map((item) => item._id);
+    const equipmentIdStrings = equipmentIds.map(String);
+    const rentals = equipmentIds.length
+      ? await rentalsCollection.find({ $or: [
+        { equipmentId: { $in: equipmentIds } },
+        { equipmentId: { $in: equipmentIdStrings } },
+      ] }).toArray()
+      : [];
+    const completed = rentals.filter((rental) => String(rental.status || rental.bookingStatus || "").toLowerCase() === "completed");
+    const monthlyEarnings = Array.from({ length: 12 }, (_, index) => {
+      const month = new Date();
+      month.setDate(1);
+      month.setHours(0, 0, 0, 0);
+      month.setMonth(month.getMonth() - (11 - index));
+      const key = `${month.getFullYear()}-${String(month.getMonth() + 1).padStart(2, "0")}`;
+      const earnings = completed.reduce((sum, rental) => {
+        const amount = Number(rental.totalAmount ?? rental.bookingAmount ?? rental.amount ?? 0);
+        const recordedAt = rental.completedAt || rental.endDate || rental.updatedAt || rental.createdAt;
+        const date = recordedAt ? new Date(recordedAt) : null;
+        return date && `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}` === key
+          ? sum + (Number.isFinite(amount) ? amount : 0)
+          : sum;
+      }, 0);
+      return { month: key, earnings: Number(earnings.toFixed(2)) };
+    });
+    res.json({
+      success: true,
+      data: {
+        listedEquipment: equipment.length,
+        completedRentals: completed.length,
+        earnings: Number(completed.reduce((sum, rental) => sum + Number(rental.totalAmount ?? rental.bookingAmount ?? rental.amount ?? 0), 0).toFixed(2)),
+        monthlyEarnings,
+      },
+    });
+  } catch (error) {
+    console.error("Owner analytics error:", error);
+    res.status(500).json({ success: false, message: "Failed to fetch owner analytics" });
+  }
+});
+
 // OWNER: Update own equipment
 app.patch(
   "/api/equipment/:id",
-  requireAuth,
-  requireRole("owner"),
+  verifyToken,
+  verifyOwner,
   async (req, res) => {
     try {
       const { id } = req.params;
@@ -632,8 +727,8 @@ app.patch(
 // OWNER: Delete own equipment
 app.delete(
   "/api/equipment/:id",
-  requireAuth,
-  requireRole("owner"),
+  verifyToken,
+  verifyOwner,
   async (req, res) => {
     try {
       const { id } = req.params;
@@ -675,8 +770,8 @@ app.delete(
 // ADMIN: Get all equipment
 app.get(
   "/api/admin/equipment",
-  requireAuth,
-  requireRole("admin"),
+  verifyToken,
+  verifyAdmin,
   async (req, res) => {
     try {
       const { status } = req.query;
@@ -717,8 +812,8 @@ app.get(
 // ADMIN: Approve or reject equipment
 app.patch(
   "/api/admin/equipment/:id/status",
-  requireAuth,
-  requireRole("admin"),
+  verifyToken,
+  verifyAdmin,
   async (req, res) => {
     try {
       const { id } = req.params;
@@ -776,7 +871,51 @@ app.patch(
 );
 
 // ADMIN: Manage registered users
-app.get("/api/admin/users", requireAuth, requireRole("admin"), async (_req, res) => {
+app.get("/api/admin/analytics", verifyToken, verifyAdmin, async (_req, res) => {
+  try {
+    const [users, equipment, rentals, payments] = await Promise.all([
+      usersCollection.find({}, { projection: { _id: 1 } }).toArray(),
+      equipmentCollection.find({}, { projection: { _id: 1, status: 1 } }).toArray(),
+      rentalsCollection.find({}, { projection: { status: 1, bookingStatus: 1, createdAt: 1 } }).toArray(),
+      paymentsCollection.find({ status: "paid" }, { projection: { amount: 1, createdAt: 1 } }).toArray(),
+    ]);
+    const monthlyBookings = Array.from({ length: 12 }, (_, index) => {
+      const month = new Date();
+      month.setDate(1);
+      month.setHours(0, 0, 0, 0);
+      month.setMonth(month.getMonth() - (11 - index));
+      const key = `${month.getFullYear()}-${String(month.getMonth() + 1).padStart(2, "0")}`;
+      return {
+        month: key,
+        bookings: rentals.filter((rental) => {
+          const date = rental.createdAt ? new Date(rental.createdAt) : null;
+          return date && `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}` === key;
+        }).length,
+      };
+    });
+    const revenue = payments.reduce((sum, payment) => {
+      const amount = Number(payment.amount || 0);
+      return sum + (Number.isFinite(amount) ? amount : 0);
+    }, 0);
+    res.json({
+      success: true,
+      data: {
+        users: users.length,
+        equipment: equipment.length,
+        bookings: rentals.length,
+        approvals: equipment.filter((item) => String(item.status || "").toLowerCase() === "approved").length,
+        completedRentals: rentals.filter((rental) => String(rental.status || rental.bookingStatus || "").toLowerCase() === "completed").length,
+        revenue: Number(revenue.toFixed(2)),
+        monthlyBookings,
+      },
+    });
+  } catch (error) {
+    console.error("Admin analytics error:", error);
+    res.status(500).json({ success: false, message: "Failed to fetch admin analytics" });
+  }
+});
+
+app.get("/api/admin/users", verifyToken, verifyAdmin, async (_req, res) => {
   try {
     const users = await usersCollection
       .find({}, { projection: { name: 1, email: 1, role: 1, createdAt: 1, disabled: 1, emailVerified: 1 } })
@@ -793,7 +932,7 @@ app.get("/api/admin/users", requireAuth, requireRole("admin"), async (_req, res)
   }
 });
 
-app.patch("/api/admin/users/:id/role", requireAuth, requireRole("admin"), async (req, res) => {
+app.patch("/api/admin/users/:id/role", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { role } = req.body;
@@ -808,7 +947,7 @@ app.patch("/api/admin/users/:id/role", requireAuth, requireRole("admin"), async 
   }
 });
 
-app.patch("/api/admin/users/:id/access", requireAuth, requireRole("admin"), async (req, res) => {
+app.patch("/api/admin/users/:id/access", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { disabled } = req.body;
@@ -824,7 +963,7 @@ app.patch("/api/admin/users/:id/access", requireAuth, requireRole("admin"), asyn
 });
 
 // ADMIN: Edit and remove equipment listings
-app.patch("/api/admin/equipment/:id", requireAuth, requireRole("admin"), async (req, res) => {
+app.patch("/api/admin/equipment/:id", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     if (!ObjectId.isValid(id)) return res.status(400).json({ success: false, message: "Invalid equipment ID" });
@@ -845,7 +984,7 @@ app.patch("/api/admin/equipment/:id", requireAuth, requireRole("admin"), async (
   }
 });
 
-app.delete("/api/admin/equipment/:id", requireAuth, requireRole("admin"), async (req, res) => {
+app.delete("/api/admin/equipment/:id", verifyToken, verifyAdmin, async (req, res) => {
   try {
     if (!ObjectId.isValid(req.params.id)) return res.status(400).json({ success: false, message: "Invalid equipment ID" });
     const result = await equipmentCollection.deleteOne({ _id: new ObjectId(req.params.id) });
@@ -858,7 +997,7 @@ app.delete("/api/admin/equipment/:id", requireAuth, requireRole("admin"), async 
 });
 
 // ADMIN: Monitor and update rental bookings
-app.get("/api/admin/rentals", requireAuth, requireRole("admin"), async (_req, res) => {
+app.get("/api/admin/rentals", verifyToken, verifyAdmin, async (_req, res) => {
   try {
     const [rentals, equipment, users] = await Promise.all([
       rentalsCollection.find({}).sort({ createdAt: -1 }).toArray(),
@@ -891,7 +1030,7 @@ app.get("/api/admin/rentals", requireAuth, requireRole("admin"), async (_req, re
   }
 });
 
-app.patch("/api/admin/rentals/:id/status", requireAuth, requireRole("admin"), async (req, res) => {
+app.patch("/api/admin/rentals/:id/status", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { status } = req.body;
@@ -904,10 +1043,23 @@ app.patch("/api/admin/rentals/:id/status", requireAuth, requireRole("admin"), as
     const shouldRelease = terminalStatuses.includes(status) && !rental.inventoryReleased;
     const result = await rentalsCollection.updateOne(
       { _id: rental._id, status: rental.status, ...(shouldRelease ? { inventoryReleased: { $ne: true } } : {}) },
-      { $set: { status, bookingStatus: status, ...(shouldRelease ? { inventoryReleased: true } : {}), updatedAt: new Date() } }
+      { $set: {
+        status,
+        bookingStatus: status,
+        ...(status === "completed" ? { completedAt: new Date() } : {}),
+        ...(shouldRelease ? { inventoryReleased: true } : {}),
+        updatedAt: new Date(),
+      } }
     );
     if (!result.matchedCount) return res.status(409).json({ success: false, message: "Rental status changed. Refresh and try again." });
     if (shouldRelease) await equipmentCollection.updateOne({ _id: rental.equipmentId }, { $inc: { availableQuantity: rental.quantity || rental.requiredQuantity || 0 } });
+    if (rental.status !== status) {
+      await notifyRental(
+        [rental.customerEmail, rental.ownerEmail],
+        `Rental status updated: ${rental.equipmentName || "equipment"}`,
+        `The booking for ${rental.equipmentName || "your equipment"} is now ${status}.`
+      );
+    }
     res.json({ success: true, message: "Rental status updated" });
   } catch (error) {
     console.error("Admin rental status update error:", error);
@@ -916,7 +1068,7 @@ app.patch("/api/admin/rentals/:id/status", requireAuth, requireRole("admin"), as
 });
 
 // Any signed-in user: read and update their own profile
-app.get("/api/profile", requireAuth, async (req, res) => {
+app.get("/api/profile", verifyToken, async (req, res) => {
   try {
     const user = await usersCollection.findOne(userIdQuery(req.user.id), {
       projection: { name: 1, email: 1, image: 1, phoneNumber: 1, address: 1, role: 1 },
@@ -929,7 +1081,7 @@ app.get("/api/profile", requireAuth, async (req, res) => {
   }
 });
 
-app.patch("/api/profile", requireAuth, async (req, res) => {
+app.patch("/api/profile", verifyToken, async (req, res) => {
   try {
     const allowed = ["name", "image", "phoneNumber", "address"];
     const changes = Object.fromEntries(allowed.filter((field) => req.body[field] !== undefined).map((field) => [field, req.body[field]]));
@@ -951,7 +1103,7 @@ app.patch("/api/profile", requireAuth, async (req, res) => {
 });
 
 // CUSTOMER: their own rental bookings
-app.get("/api/customer/rentals", requireAuth, requireRole("customer"), async (req, res) => {
+app.get("/api/customer/rentals", verifyToken, verifyRenter, async (req, res) => {
   try {
     const customerIds = [req.user.id, ...(ObjectId.isValid(req.user.id) ? [new ObjectId(req.user.id)] : [])];
     const rentals = await rentalsCollection.find({ $or: [
@@ -982,7 +1134,7 @@ app.get("/api/customer/rentals", requireAuth, requireRole("customer"), async (re
 });
 
 // CUSTOMER: manage their own favorites
-app.get("/api/customer/favorites", requireAuth, requireRole("customer"), async (req, res) => {
+app.get("/api/customer/favorites", verifyToken, verifyRenter, async (req, res) => {
   try {
     const user = await usersCollection.findOne(userIdQuery(req.user.id), { projection: { favorites: 1 } });
     const ids = (user?.favorites || []).map(String);
@@ -994,7 +1146,7 @@ app.get("/api/customer/favorites", requireAuth, requireRole("customer"), async (
   }
 });
 
-app.post("/api/customer/favorites/:equipmentId", requireAuth, requireRole("customer"), async (req, res) => {
+app.post("/api/customer/favorites/:equipmentId", verifyToken, verifyRenter, async (req, res) => {
   try {
     const { equipmentId } = req.params;
     if (!ObjectId.isValid(equipmentId)) return res.status(400).json({ success: false, message: "Invalid equipment ID" });
@@ -1008,7 +1160,7 @@ app.post("/api/customer/favorites/:equipmentId", requireAuth, requireRole("custo
   }
 });
 
-app.delete("/api/customer/favorites/:equipmentId", requireAuth, requireRole("customer"), async (req, res) => {
+app.delete("/api/customer/favorites/:equipmentId", verifyToken, verifyRenter, async (req, res) => {
   try {
     const { equipmentId } = req.params;
     if (!ObjectId.isValid(equipmentId)) return res.status(400).json({ success: false, message: "Invalid equipment ID" });
@@ -1021,7 +1173,7 @@ app.delete("/api/customer/favorites/:equipmentId", requireAuth, requireRole("cus
 });
 
 // CUSTOMER: reserve available quantity and create a hosted Stripe Checkout Session
-app.post("/api/customer/equipment/:equipmentId/checkout", requireAuth, requireRole("customer"), async (req, res) => {
+app.post("/api/customer/equipment/:equipmentId/checkout", verifyToken, verifyRenter, async (req, res) => {
   let reservationId;
   let inventoryReserved = false;
   try {
@@ -1127,7 +1279,7 @@ app.post("/api/customer/equipment/:equipmentId/checkout", requireAuth, requireRo
 });
 
 // CUSTOMER: cancel an open checkout and release its inventory hold
-app.post("/api/customer/checkout/:reservationId/cancel", requireAuth, requireRole("customer"), async (req, res) => {
+app.post("/api/customer/checkout/:reservationId/cancel", verifyToken, verifyRenter, async (req, res) => {
   try {
     const { reservationId } = req.params;
     if (!ObjectId.isValid(reservationId)) return res.status(400).json({ success: false, message: "Invalid reservation ID" });
@@ -1148,7 +1300,7 @@ app.post("/api/customer/checkout/:reservationId/cancel", requireAuth, requireRol
 });
 
 // CUSTOMER: retrieve their own Checkout result for the confirmation screen
-app.get("/api/customer/checkout/:sessionId", requireAuth, requireRole("customer"), async (req, res) => {
+app.get("/api/customer/checkout/:sessionId", verifyToken, verifyRenter, async (req, res) => {
   try {
     const session = await getStripe().checkout.sessions.retrieve(req.params.sessionId);
     if (session.client_reference_id !== req.user.id) return res.status(404).json({ success: false, message: "Checkout session not found" });
@@ -1160,6 +1312,42 @@ app.get("/api/customer/checkout/:sessionId", requireAuth, requireRole("customer"
     res.status(404).json({ success: false, message: "Checkout session not found" });
   }
 });
+
+const completeDueRentals = async () => {
+  if (completionJobRunning || !rentalsCollection) return;
+  completionJobRunning = true;
+  try {
+    const now = new Date();
+    const dueRentals = await rentalsCollection.find({
+      status: "approved",
+      inventoryReleased: { $ne: true },
+      $or: [
+        { endDate: { $lte: now.toISOString() } },
+        { endDate: { $lte: now } },
+      ],
+    }).toArray();
+    for (const rental of dueRentals) {
+      const result = await rentalsCollection.updateOne(
+        { _id: rental._id, status: "approved", inventoryReleased: { $ne: true } },
+        { $set: { status: "completed", bookingStatus: "completed", completedAt: now, inventoryReleased: true, updatedAt: now } }
+      );
+      if (!result.modifiedCount) continue;
+      await equipmentCollection.updateOne(
+        { _id: rental.equipmentId },
+        { $inc: { availableQuantity: rental.quantity || rental.requiredQuantity || 0 } }
+      );
+      await notifyRental(
+        [rental.customerEmail, rental.ownerEmail],
+        `Rental completed: ${rental.equipmentName || "equipment"}`,
+        `The rental for ${rental.equipmentName || "your equipment"} has been marked complete.`
+      );
+    }
+  } catch (error) {
+    console.error("Scheduled rental completion failed:", error);
+  } finally {
+    completionJobRunning = false;
+  }
+};
 
 // Start server
 async function startServer() {
@@ -1200,6 +1388,8 @@ async function startServer() {
 
     console.log("MongoDB connected successfully");
     console.log("Better Auth session verification configured");
+    await completeDueRentals();
+    setInterval(() => void completeDueRentals(), 60 * 60 * 1000);
 
     app.listen(PORT, () => {
       console.log(`ShareKit server running on port ${PORT}`);
