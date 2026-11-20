@@ -27,6 +27,7 @@ const getStripe = () => {
 };
 
 const periodDays = (rentalType) => rentalType === "weekly" ? 7 : rentalType === "monthly" ? 30 : 1;
+const equipmentSlug = (name) => name.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "equipment";
 
 const releaseReservation = async (reservationId, status) => {
   if (!ObjectId.isValid(reservationId)) return;
@@ -295,6 +296,22 @@ app.get("/api/equipment", async (req, res) => {
   }
 });
 
+app.get("/api/equipment/by-name/:name", async (req, res) => {
+  try {
+    const name = req.params.name.toLowerCase();
+    let equipment = await equipmentCollection.find({ status: "approved", slug: name }).sort({ createdAt: -1 }).limit(1).next();
+    if (!equipment) {
+      const approved = await equipmentCollection.find({ status: "approved" }).sort({ createdAt: -1 }).toArray();
+      equipment = approved.find((item) => equipmentSlug(item.name) === name);
+    }
+    if (!equipment) return res.status(404).json({ success: false, message: "Equipment not found" });
+    res.json({ success: true, data: { ...equipment, _id: equipment._id.toString() } });
+  } catch (error) {
+    console.error("Equipment detail fetch error:", error);
+    res.status(500).json({ success: false, message: "Failed to fetch equipment details" });
+  }
+});
+
 app.get("/api/equipment/:id", async (req, res) => {
   try {
     if (!ObjectId.isValid(req.params.id)) return res.status(400).json({ success: false, message: "Invalid equipment ID" });
@@ -377,6 +394,7 @@ app.post(
 
       const equipment = {
         name: name.trim(),
+        slug: equipmentSlug(name),
         description: description.trim(),
         category,
         location: location.trim(),
@@ -530,6 +548,10 @@ app.patch(
         if (req.body[field] !== undefined) {
           updateData[field] = req.body[field];
         }
+      }
+
+      if (updateData.name !== undefined && typeof updateData.name === "string") {
+        updateData.slug = equipmentSlug(updateData.name);
       }
 
       if (!Object.keys(updateData).length) {
@@ -809,6 +831,7 @@ app.patch("/api/admin/equipment/:id", requireAuth, requireRole("admin"), async (
     const allowed = ["name", "description", "category", "location", "price", "rentalType", "availableQuantity", "condition", "brand", "model", "image", "rentalTerms"];
     const updateData = Object.fromEntries(allowed.filter((field) => req.body[field] !== undefined).map((field) => [field, req.body[field]]));
     if (!Object.keys(updateData).length) return res.status(400).json({ success: false, message: "No valid fields provided" });
+    if (updateData.name !== undefined && typeof updateData.name === "string") updateData.slug = equipmentSlug(updateData.name);
     if (updateData.price !== undefined && (typeof updateData.price !== "number" || !Number.isFinite(updateData.price) || updateData.price <= 0)) return res.status(400).json({ success: false, message: "Invalid equipment price" });
     if (updateData.availableQuantity !== undefined && (!Number.isInteger(updateData.availableQuantity) || updateData.availableQuantity < 0)) return res.status(400).json({ success: false, message: "Invalid available quantity" });
     if (updateData.rentalType !== undefined && !["daily", "weekly", "monthly"].includes(updateData.rentalType)) return res.status(400).json({ success: false, message: "Invalid rental type" });
