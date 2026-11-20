@@ -56,13 +56,13 @@ const requireAuth = async (req, res, next) => {
 
     const account = await usersCollection.findOne(
       userIdQuery(session.user.id),
-      { projection: { disabled: 1 } }
+      { projection: { disabled: 1, role: 1 } }
     );
     if (account?.disabled) {
       return res.status(403).json({ success: false, message: "This account is disabled" });
     }
 
-    req.user = session.user;
+    req.user = { ...session.user, role: account?.role || session.user.role };
     req.session = session.session;
 
     next();
@@ -191,7 +191,7 @@ app.get("/api/equipment", async (req, res) => {
 app.post(
   "/api/equipment",
   requireAuth,
-  requireRole("owner", "admin"),
+  requireRole("owner"),
   async (req, res) => {
     try {
       const {
@@ -301,7 +301,7 @@ app.post(
 app.get(
   "/api/my-equipment",
   requireAuth,
-  requireRole("owner", "admin"),
+  requireRole("owner"),
   async (req, res) => {
     try {
       const equipment = await equipmentCollection
@@ -329,7 +329,7 @@ app.get(
 app.get(
   "/api/owner/rentals",
   requireAuth,
-  requireRole("owner", "admin"),
+  requireRole("owner"),
   async (req, res) => {
     try {
       const equipment = await equipmentCollection
@@ -377,7 +377,7 @@ app.get(
 app.patch(
   "/api/equipment/:id",
   requireAuth,
-  requireRole("owner", "admin"),
+  requireRole("owner"),
   async (req, res) => {
     try {
       const { id } = req.params;
@@ -491,7 +491,7 @@ app.patch(
 app.delete(
   "/api/equipment/:id",
   requireAuth,
-  requireRole("owner", "admin"),
+  requireRole("owner"),
   async (req, res) => {
     try {
       const { id } = req.params;
@@ -760,6 +760,112 @@ app.patch("/api/admin/rentals/:id/status", requireAuth, requireRole("admin"), as
   } catch (error) {
     console.error("Admin rental status update error:", error);
     res.status(500).json({ success: false, message: "Failed to update rental status" });
+  }
+});
+
+// Any signed-in user: read and update their own profile
+app.get("/api/profile", requireAuth, async (req, res) => {
+  try {
+    const user = await usersCollection.findOne(userIdQuery(req.user.id), {
+      projection: { name: 1, email: 1, image: 1, phoneNumber: 1, address: 1, role: 1 },
+    });
+    if (!user) return res.status(404).json({ success: false, message: "Profile not found" });
+    res.json({ success: true, data: { name: user.name || "", email: user.email || "", image: user.image || "", phoneNumber: user.phoneNumber || "", address: user.address || "", role: user.role || "customer" } });
+  } catch (error) {
+    console.error("Profile fetch error:", error);
+    res.status(500).json({ success: false, message: "Failed to load profile" });
+  }
+});
+
+app.patch("/api/profile", requireAuth, async (req, res) => {
+  try {
+    const allowed = ["name", "image", "phoneNumber", "address"];
+    const changes = Object.fromEntries(allowed.filter((field) => req.body[field] !== undefined).map((field) => [field, req.body[field]]));
+    if (!Object.keys(changes).length) return res.status(400).json({ success: false, message: "No profile fields provided" });
+    for (const [field, value] of Object.entries(changes)) {
+      if (typeof value !== "string") return res.status(400).json({ success: false, message: `${field} must be text` });
+      changes[field] = value.trim();
+    }
+    if (changes.name !== undefined && !changes.name) return res.status(400).json({ success: false, message: "Name cannot be empty" });
+    if ((changes.name?.length || 0) > 120 || (changes.phoneNumber?.length || 0) > 40 || (changes.address?.length || 0) > 500 || (changes.image?.length || 0) > 2048) return res.status(400).json({ success: false, message: "Profile field is too long" });
+    changes.updatedAt = new Date();
+    const result = await usersCollection.updateOne(userIdQuery(req.user.id), { $set: changes });
+    if (!result.matchedCount) return res.status(404).json({ success: false, message: "Profile not found" });
+    res.json({ success: true, message: "Profile updated" });
+  } catch (error) {
+    console.error("Profile update error:", error);
+    res.status(500).json({ success: false, message: "Failed to update profile" });
+  }
+});
+
+// CUSTOMER: their own rental bookings
+app.get("/api/customer/rentals", requireAuth, requireRole("customer"), async (req, res) => {
+  try {
+    const identityValues = [req.user.id, req.user.email].filter(Boolean);
+    const customerIds = [req.user.id, ...(ObjectId.isValid(req.user.id) ? [new ObjectId(req.user.id)] : [])];
+    const rentals = await rentalsCollection.find({ $or: [
+      { customerId: { $in: customerIds } }, { userId: { $in: customerIds } },
+      { "customer.id": { $in: customerIds } }, { "user.id": { $in: customerIds } },
+      { customerEmail: req.user.email }, { userEmail: req.user.email },
+      { "customer.email": req.user.email }, { "user.email": req.user.email },
+    ] }).sort({ createdAt: -1 }).toArray();
+    const equipmentIds = [...new Set(rentals.map((rental) => String(rental.equipmentId || "")).filter(Boolean))];
+    const objectIds = equipmentIds.filter(ObjectId.isValid).map((id) => new ObjectId(id));
+    const equipment = await equipmentCollection.find({ _id: { $in: objectIds } }, { projection: { name: 1 } }).toArray();
+    const equipmentById = new Map(equipment.map((item) => [item._id.toString(), item.name]));
+    const data = rentals.map((rental) => ({
+      ...rental, _id: rental._id.toString(),
+      equipmentName: rental.equipmentName || rental.itemName || equipmentById.get(String(rental.equipmentId)) || "Equipment",
+      startDate: rental.startDate || rental.rentalStartDate || "",
+      endDate: rental.endDate || rental.rentalEndDate || "",
+      bookingDate: rental.bookingDate || rental.createdAt || "",
+      totalAmount: rental.totalAmount ?? rental.bookingAmount ?? rental.amount,
+      paymentStatus: rental.paymentStatus || rental.payment?.status || "Pending",
+      status: rental.status || rental.bookingStatus || "Pending",
+    }));
+    res.json({ success: true, count: data.length, data });
+  } catch (error) {
+    console.error("Customer rentals fetch error:", error);
+    res.status(500).json({ success: false, message: "Failed to fetch your rentals" });
+  }
+});
+
+// CUSTOMER: manage their own favorites
+app.get("/api/customer/favorites", requireAuth, requireRole("customer"), async (req, res) => {
+  try {
+    const user = await usersCollection.findOne(userIdQuery(req.user.id), { projection: { favorites: 1 } });
+    const ids = (user?.favorites || []).map(String);
+    const equipment = await equipmentCollection.find({ status: "approved", _id: { $in: ids.filter(ObjectId.isValid).map((id) => new ObjectId(id)) } }).sort({ createdAt: -1 }).toArray();
+    res.json({ success: true, count: equipment.length, data: equipment });
+  } catch (error) {
+    console.error("Customer favorites fetch error:", error);
+    res.status(500).json({ success: false, message: "Failed to fetch favorites" });
+  }
+});
+
+app.post("/api/customer/favorites/:equipmentId", requireAuth, requireRole("customer"), async (req, res) => {
+  try {
+    const { equipmentId } = req.params;
+    if (!ObjectId.isValid(equipmentId)) return res.status(400).json({ success: false, message: "Invalid equipment ID" });
+    const equipment = await equipmentCollection.findOne({ _id: new ObjectId(equipmentId), status: "approved" }, { projection: { _id: 1 } });
+    if (!equipment) return res.status(404).json({ success: false, message: "Approved equipment not found" });
+    await usersCollection.updateOne(userIdQuery(req.user.id), { $addToSet: { favorites: equipmentId } });
+    res.json({ success: true, message: "Added to favorites" });
+  } catch (error) {
+    console.error("Customer favorite add error:", error);
+    res.status(500).json({ success: false, message: "Failed to add favorite" });
+  }
+});
+
+app.delete("/api/customer/favorites/:equipmentId", requireAuth, requireRole("customer"), async (req, res) => {
+  try {
+    const { equipmentId } = req.params;
+    if (!ObjectId.isValid(equipmentId)) return res.status(400).json({ success: false, message: "Invalid equipment ID" });
+    await usersCollection.updateOne(userIdQuery(req.user.id), { $pull: { favorites: equipmentId } });
+    res.json({ success: true, message: "Removed from favorites" });
+  } catch (error) {
+    console.error("Customer favorite removal error:", error);
+    res.status(500).json({ success: false, message: "Failed to remove favorite" });
   }
 });
 
