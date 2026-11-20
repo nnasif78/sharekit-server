@@ -38,15 +38,27 @@ async function connectToDatabase() {
       reservationsCollection = db.collection("rentalReservations");
       paymentsCollection = db.collection("payments");
 
-      await rentalsCollection.createIndex(
-        { checkoutSessionId: 1 },
-        { unique: true, sparse: true }
-      );
-
-      await paymentsCollection.createIndex(
-        { stripeSessionId: 1 },
-        { unique: true, sparse: true }
-      );
+      await Promise.all([
+        rentalsCollection.createIndex(
+          { checkoutSessionId: 1 },
+          { unique: true, sparse: true }
+        ),
+        rentalsCollection.createIndex({ status: 1, inventoryReleased: 1, endDate: 1 }),
+        rentalsCollection.createIndex({ customerId: 1, createdAt: -1 }),
+        rentalsCollection.createIndex({ userId: 1, createdAt: -1 }),
+        rentalsCollection.createIndex({ equipmentId: 1, createdAt: -1 }),
+        paymentsCollection.createIndex(
+          { stripeSessionId: 1 },
+          { unique: true, sparse: true }
+        ),
+        paymentsCollection.createIndex({ status: 1, createdAt: -1 }),
+        reservationsCollection.createIndex({ customerId: 1, status: 1 }),
+        reservationsCollection.createIndex({ status: 1, inventoryReleased: 1 }),
+        equipmentCollection.createIndex({ status: 1, slug: 1, createdAt: -1 }),
+        equipmentCollection.createIndex({ status: 1, ownerId: 1, createdAt: -1 }),
+        equipmentCollection.createIndex({ ownerId: 1, createdAt: -1 }),
+        usersCollection.createIndex({ favorites: 1 }),
+      ]);
 
       auth = betterAuth({
         database: mongodbAdapter(db, {
@@ -212,7 +224,6 @@ app.use(
   })
 );
 
-// Connect to MongoDB before handling API requests.
 app.use(async (req, res, next) => {
   try {
     await connectToDatabase();
@@ -227,7 +238,6 @@ app.use(async (req, res, next) => {
   }
 });
 
-// Stripe requires the unparsed request bytes to verify webhook signatures.
 app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async (req, res) => {
   let event;
   try {
@@ -250,13 +260,12 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
   }
 });
 
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 
 app.get("/", (req, res) => {
   res.send("ShareKit API is running!");
 });
 
-// Health check
 app.get("/api/health", (req, res) => {
   res.json({
     success: true,
@@ -265,7 +274,6 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-// Authentication middleware
 const verifyToken = async (req, res, next) => {
   const authorization = req.headers.authorization || "";
   const token = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
@@ -320,7 +328,6 @@ const verifyRenter = verifyRole("customer");
 const verifyOwner = verifyRole("owner");
 const verifyAdmin = verifyRole("admin");
 
-// Escape user input before using regular expressions
 const escapeRegex = (value) =>
   value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -331,7 +338,6 @@ const userIdQuery = (id) => ({
   ],
 });
 
-// PUBLIC: Get approved equipment
 app.get("/api/equipment", async (req, res) => {
   try {
     const {
@@ -430,7 +436,10 @@ app.get("/api/equipment/by-name/:name", async (req, res) => {
     const name = req.params.name.toLowerCase();
     let equipment = await equipmentCollection.find({ status: "approved", slug: name }).sort({ createdAt: -1 }).limit(1).next();
     if (!equipment) {
-      const approved = await equipmentCollection.find({ status: "approved" }).sort({ createdAt: -1 }).toArray();
+      const approved = await equipmentCollection
+        .find({ status: "approved" }, { projection: { name: 1, slug: 1 } })
+        .sort({ createdAt: -1 })
+        .toArray();
       equipment = approved.find((item) => equipmentSlug(item.name) === name);
     }
     if (!equipment) return res.status(404).json({ success: false, message: "Equipment not found" });
@@ -453,7 +462,6 @@ app.get("/api/equipment/:id", async (req, res) => {
   }
 });
 
-// OWNER: Add equipment
 app.post(
   "/api/equipment",
   verifyToken,
@@ -564,7 +572,6 @@ app.post(
   }
 );
 
-// OWNER: Get own equipment
 app.get(
   "/api/my-equipment",
   verifyToken,
@@ -592,7 +599,6 @@ app.get(
   }
 );
 
-// OWNER: Get rentals for this owner's equipment
 app.get(
   "/api/owner/rentals",
   verifyToken,
@@ -649,7 +655,7 @@ app.get("/api/owner/analytics", verifyToken, verifyOwner, async (req, res) => {
       ? await rentalsCollection.find({ $or: [
         { equipmentId: { $in: equipmentIds } },
         { equipmentId: { $in: equipmentIdStrings } },
-      ] }).toArray()
+      ] }, { projection: { status: 1, bookingStatus: 1, completedAt: 1, endDate: 1, updatedAt: 1, createdAt: 1, totalAmount: 1, bookingAmount: 1, amount: 1 } }).toArray()
       : [];
     const completed = rentals.filter((rental) => String(rental.status || rental.bookingStatus || "").toLowerCase() === "completed");
     const monthlyEarnings = Array.from({ length: 12 }, (_, index) => {
@@ -657,23 +663,31 @@ app.get("/api/owner/analytics", verifyToken, verifyOwner, async (req, res) => {
       month.setDate(1);
       month.setHours(0, 0, 0, 0);
       month.setMonth(month.getMonth() - (11 - index));
-      const key = `${month.getFullYear()}-${String(month.getMonth() + 1).padStart(2, "0")}`;
-      const earnings = completed.reduce((sum, rental) => {
-        const amount = Number(rental.totalAmount ?? rental.bookingAmount ?? rental.amount ?? 0);
-        const recordedAt = rental.completedAt || rental.endDate || rental.updatedAt || rental.createdAt;
-        const date = recordedAt ? new Date(recordedAt) : null;
-        return date && `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}` === key
-          ? sum + (Number.isFinite(amount) ? amount : 0)
-          : sum;
-      }, 0);
-      return { month: key, earnings: Number(earnings.toFixed(2)) };
+      return { month: `${month.getFullYear()}-${String(month.getMonth() + 1).padStart(2, "0")}`, earnings: 0 };
+    });
+    const earningsByMonth = new Map(monthlyEarnings.map((item) => [item.month, item]));
+    let earnings = 0;
+    for (const rental of completed) {
+      const amount = Number(rental.totalAmount ?? rental.bookingAmount ?? rental.amount ?? 0);
+      const validAmount = Number.isFinite(amount) ? amount : 0;
+      earnings += validAmount;
+      const recordedAt = rental.completedAt || rental.endDate || rental.updatedAt || rental.createdAt;
+      const date = recordedAt ? new Date(recordedAt) : null;
+      if (date) {
+        const key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
+        const month = earningsByMonth.get(key);
+        if (month) month.earnings += validAmount;
+      }
+    }
+    monthlyEarnings.forEach((month) => {
+      month.earnings = Number(month.earnings.toFixed(2));
     });
     res.json({
       success: true,
       data: {
         listedEquipment: equipment.length,
         completedRentals: completed.length,
-        earnings: Number(completed.reduce((sum, rental) => sum + Number(rental.totalAmount ?? rental.bookingAmount ?? rental.amount ?? 0), 0).toFixed(2)),
+        earnings: Number(earnings.toFixed(2)),
         monthlyEarnings,
       },
     });
@@ -683,7 +697,6 @@ app.get("/api/owner/analytics", verifyToken, verifyOwner, async (req, res) => {
   }
 });
 
-// OWNER: Update own equipment
 app.patch(
   "/api/equipment/:id",
   verifyToken,
@@ -801,7 +814,6 @@ app.patch(
   }
 );
 
-// OWNER: Delete own equipment
 app.delete(
   "/api/equipment/:id",
   verifyToken,
@@ -844,7 +856,6 @@ app.delete(
   }
 );
 
-// ADMIN: Get all equipment
 app.get(
   "/api/admin/equipment",
   verifyToken,
@@ -886,7 +897,6 @@ app.get(
   }
 );
 
-// ADMIN: Approve or reject equipment
 app.patch(
   "/api/admin/equipment/:id/status",
   verifyToken,
@@ -947,7 +957,6 @@ app.patch(
   }
 );
 
-// ADMIN: Manage registered users
 app.get("/api/admin/analytics", verifyToken, verifyAdmin, async (_req, res) => {
   try {
     const [users, equipment, rentals, payments] = await Promise.all([
@@ -961,15 +970,17 @@ app.get("/api/admin/analytics", verifyToken, verifyAdmin, async (_req, res) => {
       month.setDate(1);
       month.setHours(0, 0, 0, 0);
       month.setMonth(month.getMonth() - (11 - index));
-      const key = `${month.getFullYear()}-${String(month.getMonth() + 1).padStart(2, "0")}`;
-      return {
-        month: key,
-        bookings: rentals.filter((rental) => {
-          const date = rental.createdAt ? new Date(rental.createdAt) : null;
-          return date && `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}` === key;
-        }).length,
-      };
+      return { month: `${month.getFullYear()}-${String(month.getMonth() + 1).padStart(2, "0")}`, bookings: 0 };
     });
+    const bookingsByMonth = new Map(monthlyBookings.map((item) => [item.month, item]));
+    for (const rental of rentals) {
+      const date = rental.createdAt ? new Date(rental.createdAt) : null;
+      if (date) {
+        const key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
+        const month = bookingsByMonth.get(key);
+        if (month) month.bookings++;
+      }
+    }
     const revenue = payments.reduce((sum, payment) => {
       const amount = Number(payment.amount || 0);
       return sum + (Number.isFinite(amount) ? amount : 0);
@@ -1039,7 +1050,6 @@ app.patch("/api/admin/users/:id/access", verifyToken, verifyAdmin, async (req, r
   }
 });
 
-// ADMIN: Edit and remove equipment listings
 app.patch("/api/admin/equipment/:id", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const { id } = req.params;
@@ -1073,7 +1083,6 @@ app.delete("/api/admin/equipment/:id", verifyToken, verifyAdmin, async (req, res
   }
 });
 
-// ADMIN: Monitor and update rental bookings
 app.get("/api/admin/rentals", verifyToken, verifyAdmin, async (_req, res) => {
   try {
     const [rentals, equipment, users] = await Promise.all([
@@ -1144,7 +1153,6 @@ app.patch("/api/admin/rentals/:id/status", verifyToken, verifyAdmin, async (req,
   }
 });
 
-// Any signed-in user: read and update their own profile
 app.get("/api/profile", verifyToken, async (req, res) => {
   try {
     const user = await usersCollection.findOne(userIdQuery(req.user.id), {
@@ -1179,7 +1187,6 @@ app.patch("/api/profile", verifyToken, async (req, res) => {
   }
 });
 
-// CUSTOMER: their own rental bookings
 app.get("/api/customer/rentals", verifyToken, verifyRenter, async (req, res) => {
   try {
     const customerIds = [req.user.id, ...(ObjectId.isValid(req.user.id) ? [new ObjectId(req.user.id)] : [])];
@@ -1210,7 +1217,6 @@ app.get("/api/customer/rentals", verifyToken, verifyRenter, async (req, res) => 
   }
 });
 
-// CUSTOMER: manage their own favorites
 app.get("/api/customer/favorites", verifyToken, verifyRenter, async (req, res) => {
   try {
     const user = await usersCollection.findOne(userIdQuery(req.user.id), { projection: { favorites: 1 } });
@@ -1249,7 +1255,6 @@ app.delete("/api/customer/favorites/:equipmentId", verifyToken, verifyRenter, as
   }
 });
 
-// CUSTOMER: reserve available quantity and create a hosted Stripe Checkout Session
 app.post("/api/customer/equipment/:equipmentId/checkout", verifyToken, verifyRenter, async (req, res) => {
   let reservationId;
   let inventoryReserved = false;
@@ -1355,7 +1360,6 @@ app.post("/api/customer/equipment/:equipmentId/checkout", verifyToken, verifyRen
   }
 });
 
-// CUSTOMER: cancel an open checkout and release its inventory hold
 app.post("/api/customer/checkout/:reservationId/cancel", verifyToken, verifyRenter, async (req, res) => {
   try {
     const { reservationId } = req.params;
@@ -1376,7 +1380,6 @@ app.post("/api/customer/checkout/:reservationId/cancel", verifyToken, verifyRent
   }
 });
 
-// CUSTOMER: retrieve their own Checkout result for the confirmation screen
 app.get("/api/customer/checkout/:sessionId", verifyToken, verifyRenter, async (req, res) => {
   try {
     const session = await getStripe().checkout.sessions.retrieve(req.params.sessionId);
@@ -1427,7 +1430,6 @@ const completeDueRentals = async () => {
   }
 };
 
-// Vercel Cron: complete rentals whose end dates have passed.
 app.get("/api/cron/complete-rentals", async (req, res) => {
   const cronSecret = process.env.CRON_SECRET;
 
@@ -1462,8 +1464,6 @@ app.get("/api/cron/complete-rentals", async (req, res) => {
   }
 });
 
-// Local development server.
-// Vercel imports the Express app directly.
 if (!process.env.VERCEL) {
   app.listen(PORT, () => {
     console.log(`ShareKit server running on port ${PORT}`);
