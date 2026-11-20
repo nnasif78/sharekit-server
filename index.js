@@ -15,6 +15,7 @@ const client = new MongoClient(process.env.MONGODB_URI);
 let db;
 let auth;
 let equipmentCollection;
+let rentalsCollection;
 
 app.use(
   cors({
@@ -308,6 +309,54 @@ app.get(
   }
 );
 
+// OWNER: Get rentals for this owner's equipment
+app.get(
+  "/api/owner/rentals",
+  requireAuth,
+  requireRole("owner", "admin"),
+  async (req, res) => {
+    try {
+      const equipment = await equipmentCollection
+        .find({ ownerId: req.user.id })
+        .project({ _id: 1, name: 1 })
+        .toArray();
+      const equipmentById = new Map(equipment.map((item) => [item._id.toString(), item]));
+      const ids = equipment.map((item) => item._id);
+      const idStrings = ids.map((id) => id.toString());
+
+      if (!ids.length) {
+        return res.json({ success: true, count: 0, data: [] });
+      }
+
+      const rentals = await rentalsCollection
+        .find({ $or: [{ equipmentId: { $in: ids } }, { equipmentId: { $in: idStrings } }] })
+        .sort({ createdAt: -1 })
+        .toArray();
+
+      const data = rentals.map((rental) => {
+        const linkedEquipment = equipmentById.get(String(rental.equipmentId));
+        return {
+          ...rental,
+          _id: rental._id.toString(),
+          equipmentName: rental.equipmentName || rental.itemName || linkedEquipment?.name || "Equipment",
+          customerName: rental.customerName || rental.userName || rental.customer?.name || rental.user?.name || "Customer",
+          customerEmail: rental.customerEmail || rental.userEmail || rental.customer?.email || rental.user?.email || "",
+          duration: rental.duration || rental.rentalDuration || "",
+          quantity: rental.quantity ?? rental.requiredQuantity,
+          bookingAmount: rental.bookingAmount ?? rental.totalAmount ?? rental.amount,
+          paymentStatus: rental.paymentStatus || rental.payment?.status || "Pending",
+          status: rental.status || rental.bookingStatus || "Pending",
+        };
+      });
+
+      res.json({ success: true, count: data.length, data });
+    } catch (error) {
+      console.error("Owner rentals fetch error:", error);
+      res.status(500).json({ success: false, message: "Failed to fetch your equipment rentals" });
+    }
+  }
+);
+
 // OWNER: Update own equipment
 app.patch(
   "/api/equipment/:id",
@@ -576,6 +625,7 @@ async function startServer() {
     db = client.db(process.env.DB_NAME || "sharekit");
 
     equipmentCollection = db.collection("equipment");
+    rentalsCollection = db.collection("rentals");
 
     // Better Auth uses the same MongoDB database and secret
     auth = betterAuth({
