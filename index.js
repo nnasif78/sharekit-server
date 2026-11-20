@@ -16,6 +16,7 @@ let db;
 let auth;
 let equipmentCollection;
 let rentalsCollection;
+let usersCollection;
 
 app.use(
   cors({
@@ -53,6 +54,14 @@ const requireAuth = async (req, res, next) => {
       });
     }
 
+    const account = await usersCollection.findOne(
+      userIdQuery(session.user.id),
+      { projection: { disabled: 1 } }
+    );
+    if (account?.disabled) {
+      return res.status(403).json({ success: false, message: "This account is disabled" });
+    }
+
     req.user = session.user;
     req.session = session.session;
 
@@ -84,6 +93,13 @@ const requireRole = (...roles) => {
 // Escape user input before using regular expressions
 const escapeRegex = (value) =>
   value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const userIdQuery = (id) => ({
+  $or: [
+    { _id: id },
+    ...(ObjectId.isValid(id) ? [{ _id: new ObjectId(id) }] : []),
+  ],
+});
 
 // PUBLIC: Get approved equipment
 app.get("/api/equipment", async (req, res) => {
@@ -617,6 +633,136 @@ app.patch(
   }
 );
 
+// ADMIN: Manage registered users
+app.get("/api/admin/users", requireAuth, requireRole("admin"), async (_req, res) => {
+  try {
+    const users = await usersCollection
+      .find({}, { projection: { name: 1, email: 1, role: 1, createdAt: 1, disabled: 1, emailVerified: 1 } })
+      .sort({ createdAt: -1 })
+      .toArray();
+    res.json({ success: true, count: users.length, data: users.map((user) => ({
+      _id: user._id.toString(), name: user.name, email: user.email,
+      role: user.role || "customer", createdAt: user.createdAt,
+      disabled: Boolean(user.disabled), emailVerified: Boolean(user.emailVerified),
+    })) });
+  } catch (error) {
+    console.error("Admin users fetch error:", error);
+    res.status(500).json({ success: false, message: "Failed to fetch users" });
+  }
+});
+
+app.patch("/api/admin/users/:id/role", requireAuth, requireRole("admin"), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { role } = req.body;
+    if (!["customer", "owner", "admin"].includes(role)) return res.status(400).json({ success: false, message: "Role must be customer, owner, or admin" });
+    if (id === req.user.id && role !== "admin") return res.status(400).json({ success: false, message: "You cannot remove your own admin role" });
+    const result = await usersCollection.updateOne(userIdQuery(id), { $set: { role, updatedAt: new Date() } });
+    if (!result.matchedCount) return res.status(404).json({ success: false, message: "User not found" });
+    res.json({ success: true, message: "User role updated" });
+  } catch (error) {
+    console.error("Admin user role update error:", error);
+    res.status(500).json({ success: false, message: "Failed to update user role" });
+  }
+});
+
+app.patch("/api/admin/users/:id/access", requireAuth, requireRole("admin"), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { disabled } = req.body;
+    if (typeof disabled !== "boolean") return res.status(400).json({ success: false, message: "disabled must be a boolean" });
+    if (id === req.user.id && disabled) return res.status(400).json({ success: false, message: "You cannot disable your own account" });
+    const result = await usersCollection.updateOne(userIdQuery(id), { $set: { disabled, updatedAt: new Date() } });
+    if (!result.matchedCount) return res.status(404).json({ success: false, message: "User not found" });
+    res.json({ success: true, message: disabled ? "User access disabled" : "User access restored" });
+  } catch (error) {
+    console.error("Admin user access update error:", error);
+    res.status(500).json({ success: false, message: "Failed to update user access" });
+  }
+});
+
+// ADMIN: Edit and remove equipment listings
+app.patch("/api/admin/equipment/:id", requireAuth, requireRole("admin"), async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) return res.status(400).json({ success: false, message: "Invalid equipment ID" });
+    const allowed = ["name", "description", "category", "location", "price", "rentalType", "availableQuantity", "condition", "brand", "model", "image", "rentalTerms"];
+    const updateData = Object.fromEntries(allowed.filter((field) => req.body[field] !== undefined).map((field) => [field, req.body[field]]));
+    if (!Object.keys(updateData).length) return res.status(400).json({ success: false, message: "No valid fields provided" });
+    if (updateData.price !== undefined && (typeof updateData.price !== "number" || !Number.isFinite(updateData.price) || updateData.price <= 0)) return res.status(400).json({ success: false, message: "Invalid equipment price" });
+    if (updateData.availableQuantity !== undefined && (!Number.isInteger(updateData.availableQuantity) || updateData.availableQuantity < 0)) return res.status(400).json({ success: false, message: "Invalid available quantity" });
+    if (updateData.rentalType !== undefined && !["daily", "weekly", "monthly"].includes(updateData.rentalType)) return res.status(400).json({ success: false, message: "Invalid rental type" });
+    updateData.updatedAt = new Date();
+    const result = await equipmentCollection.updateOne({ _id: new ObjectId(id) }, { $set: updateData });
+    if (!result.matchedCount) return res.status(404).json({ success: false, message: "Equipment not found" });
+    res.json({ success: true, message: "Equipment updated" });
+  } catch (error) {
+    console.error("Admin equipment update error:", error);
+    res.status(500).json({ success: false, message: "Failed to update equipment" });
+  }
+});
+
+app.delete("/api/admin/equipment/:id", requireAuth, requireRole("admin"), async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) return res.status(400).json({ success: false, message: "Invalid equipment ID" });
+    const result = await equipmentCollection.deleteOne({ _id: new ObjectId(req.params.id) });
+    if (!result.deletedCount) return res.status(404).json({ success: false, message: "Equipment not found" });
+    res.json({ success: true, message: "Equipment deleted" });
+  } catch (error) {
+    console.error("Admin equipment deletion error:", error);
+    res.status(500).json({ success: false, message: "Failed to delete equipment" });
+  }
+});
+
+// ADMIN: Monitor and update rental bookings
+app.get("/api/admin/rentals", requireAuth, requireRole("admin"), async (_req, res) => {
+  try {
+    const [rentals, equipment, users] = await Promise.all([
+      rentalsCollection.find({}).sort({ createdAt: -1 }).toArray(),
+      equipmentCollection.find({}, { projection: { name: 1, ownerId: 1, ownerName: 1, ownerEmail: 1 } }).toArray(),
+      usersCollection.find({}, { projection: { name: 1, email: 1 } }).toArray(),
+    ]);
+    const equipmentById = new Map(equipment.map((item) => [item._id.toString(), item]));
+    const usersById = new Map(users.map((user) => [user._id.toString(), user]));
+    const data = rentals.map((rental) => {
+      const linked = equipmentById.get(String(rental.equipmentId));
+      const customer = usersById.get(String(rental.customerId || rental.userId));
+      const owner = usersById.get(String(linked?.ownerId || rental.ownerId));
+      return {
+        ...rental, _id: rental._id.toString(),
+        customerName: rental.customerName || rental.userName || rental.customer?.name || customer?.name || "Customer",
+        customerEmail: rental.customerEmail || rental.userEmail || rental.customer?.email || customer?.email || "",
+        ownerName: rental.ownerName || linked?.ownerName || owner?.name || "Owner",
+        ownerEmail: rental.ownerEmail || linked?.ownerEmail || owner?.email || "",
+        equipmentName: rental.equipmentName || rental.itemName || linked?.name || "Equipment",
+        duration: rental.duration || rental.rentalDuration || "",
+        bookingAmount: rental.bookingAmount ?? rental.totalAmount ?? rental.amount,
+        paymentStatus: rental.paymentStatus || rental.payment?.status || "Pending",
+        status: rental.status || rental.bookingStatus || "Pending",
+      };
+    });
+    res.json({ success: true, count: data.length, data });
+  } catch (error) {
+    console.error("Admin rentals fetch error:", error);
+    res.status(500).json({ success: false, message: "Failed to fetch rentals" });
+  }
+});
+
+app.patch("/api/admin/rentals/:id/status", requireAuth, requireRole("admin"), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+    if (!ObjectId.isValid(id)) return res.status(400).json({ success: false, message: "Invalid rental ID" });
+    if (!["pending", "approved", "rejected", "cancelled", "completed"].includes(status)) return res.status(400).json({ success: false, message: "Invalid booking status" });
+    const result = await rentalsCollection.updateOne({ _id: new ObjectId(id) }, { $set: { status, bookingStatus: status, updatedAt: new Date() } });
+    if (!result.matchedCount) return res.status(404).json({ success: false, message: "Rental not found" });
+    res.json({ success: true, message: "Rental status updated" });
+  } catch (error) {
+    console.error("Admin rental status update error:", error);
+    res.status(500).json({ success: false, message: "Failed to update rental status" });
+  }
+});
+
 // Start server
 async function startServer() {
   try {
@@ -626,6 +772,7 @@ async function startServer() {
 
     equipmentCollection = db.collection("equipment");
     rentalsCollection = db.collection("rentals");
+    usersCollection = db.collection("user");
 
     // Better Auth uses the same MongoDB database and secret
     auth = betterAuth({
